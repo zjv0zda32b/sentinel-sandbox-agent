@@ -51,13 +51,20 @@ type payload struct {
 	Snapshots   map[string]interface{} `json:"snapshots"`
 }
 
-var version = "0.1.2"
+var version = "0.1.3"
+
+// Site defaults; release builds override them via -ldflags -X.
+var (
+	defaultCollector = "127.0.0.1:8443"
+	defaultSNI       = "telemetry.local"
+	defaultALPN      = ""
+)
 
 func main() {
 	mode := flag.String("mode", "stats", "stats|full")
-	collector := flag.String("collector", "127.0.0.1:8443", "collector host:port")
-	sni := flag.String("sni", "telemetry.local", "collector TLS SNI")
-	alpn := flag.String("alpn", "", "optional ALPN token for SNI-filtered egress")
+	collector := flag.String("collector", defaultCollector, "collector host:port")
+	sni := flag.String("sni", defaultSNI, "collector TLS SNI")
+	alpn := flag.String("alpn", defaultALPN, "optional ALPN token for SNI-filtered egress")
 	dryrun := flag.Bool("dryrun", false, "print only, do not report")
 	every := flag.Int("every", 30, "watch mode: seconds between collections (0 = single shot)")
 	watchFor := flag.Int("for", 600, "watch mode: total seconds to run")
@@ -95,10 +102,10 @@ func runOnce(mode, collector, sni, alpn string, dryrun bool) {
 		return
 	}
 	if err := report(collector, sni, alpn, "/intake/v1/series", out); err != nil {
-		fmt.Printf("collector: report failed (%v)\n", err)
+		fmt.Fprintf(os.Stderr, "collector: report failed (%v)\n", err)
 		return
 	}
-	fmt.Println("collector: HTTP 200")
+	fmt.Fprintln(os.Stderr, "collector: HTTP 200")
 }
 
 func collectStats(p *payload) {

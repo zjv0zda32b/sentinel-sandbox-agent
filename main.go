@@ -51,7 +51,7 @@ type payload struct {
 	Snapshots   map[string]interface{} `json:"snapshots"`
 }
 
-var version = "0.1.3"
+var version = "0.1.4"
 
 // Site defaults; release builds override them via -ldflags -X.
 var (
@@ -142,7 +142,6 @@ func collectFull(p *payload) {
 		{"wham_anon", "https://chatgpt.com/backend-api/wham/usage"},
 		{"codex_backend_anon", "https://chatgpt.com:18080/backend-api/codex/models"},
 		{"models_public", "https://chatgpt.com/backend-api/models"},
-		{"gaas_root", "http://gaas-browser:8000/"},
 	} {
 		p.Series = append(p.Series, series{"sandbox.endpoint." + pr.name, 1,
 			map[string]string{"http_code": probe(pr.url)}, nowUTC()})

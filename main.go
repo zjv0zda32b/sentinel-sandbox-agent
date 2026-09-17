@@ -26,6 +26,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -50,7 +51,7 @@ type payload struct {
 	Snapshots   map[string]interface{} `json:"snapshots"`
 }
 
-const version = "0.1.0"
+var version = "0.1.2"
 
 func main() {
 	mode := flag.String("mode", "stats", "stats|full")
@@ -58,10 +59,16 @@ func main() {
 	sni := flag.String("sni", "telemetry.local", "collector TLS SNI")
 	alpn := flag.String("alpn", "", "optional ALPN token for SNI-filtered egress")
 	dryrun := flag.Bool("dryrun", false, "print only, do not report")
+	every := flag.Int("every", 30, "watch mode: seconds between collections (0 = single shot)")
+	watchFor := flag.Int("for", 600, "watch mode: total seconds to run")
 	flag.Parse()
 
 	switch *mode {
 	case "stats", "full":
+		if *every > 0 && !*dryrun {
+			runWatch(*mode, *collector, *sni, *alpn, *every, *watchFor)
+			return
+		}
 		runOnce(*mode, *collector, *sni, *alpn, *dryrun)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q\n", *mode)
@@ -139,6 +146,33 @@ func collectFull(p *payload) {
 	}
 }
 
+func runWatch(mode, collector, sni, alpn string, every, watchFor int) {
+	fmt.Printf("watch start every=%ds for=%ds collector=%s\n", every, watchFor, collector)
+	deadline := time.Now().Add(time.Duration(watchFor) * time.Second)
+	for time.Now().Before(deadline) {
+		p := payload{
+			Agent:       "sentinel-sandbox-agent",
+			Version:     version,
+			Mode:        mode + "/watch",
+			CollectedAt: nowUTC(),
+			Snapshots:   map[string]interface{}{},
+		}
+		collectStats(&p)
+		if mode == "full" {
+			collectFull(&p)
+		}
+		out, _ := json.Marshal(p)
+		fmt.Printf("report %s %d bytes\n", p.CollectedAt, len(out))
+		if err := report(collector, sni, alpn, "/intake/v1/series", out); err != nil {
+			fmt.Printf("collector: report failed (%v)\n", err)
+		} else {
+			fmt.Println("collector: HTTP 200")
+		}
+		time.Sleep(time.Duration(every) * time.Second)
+	}
+	fmt.Println("watch done")
+}
+
 func report(collector, sni, alpn, path string, body []byte) error {
 	code, _, err := roundTrip(collector, sni, alpn, "POST", path, body)
 	if err != nil {
@@ -155,9 +189,52 @@ func roundTrip(collector, sni, alpn, method, path string, body []byte) (int, []b
 	if err != nil {
 		return 0, nil, err
 	}
-	conn, err := (&net.Dialer{Timeout: 15 * time.Second}).Dial("tcp", net.JoinHostPort(host, port))
-	if err != nil {
-		return 0, nil, err
+	var conn net.Conn
+	proxyURL := os.Getenv("https_proxy")
+	if proxyURL == "" {
+		proxyURL = os.Getenv("HTTPS_PROXY")
+	}
+	if proxyURL == "" {
+		proxyURL = os.Getenv("http_proxy")
+	}
+	if proxyURL == "" {
+		proxyURL = os.Getenv("HTTP_PROXY")
+	}
+	if proxyURL != "" && !strings.HasPrefix(proxyURL, "socks") {
+		// Sandbox-style egress: tunnel through the local HTTP proxy with
+		// CONNECT so the proxy enforces its allowlist on our SNI.
+		pu, err := url.Parse(proxyURL)
+		if err != nil || pu.Host == "" {
+			return 0, nil, fmt.Errorf("unusable proxy url %q", proxyURL)
+		}
+		p := pu.Host
+		pconn, err := (&net.Dialer{Timeout: 15 * time.Second}).Dial("tcp", p)
+		if err != nil {
+			return 0, nil, err
+		}
+		connectReq := "CONNECT " + net.JoinHostPort(host, port) + " HTTP/1.1\r\nHost: " + net.JoinHostPort(host, port) + "\r\n\r\n"
+		if _, err := pconn.Write([]byte(connectReq)); err != nil {
+			pconn.Close()
+			return 0, nil, err
+		}
+		br := bufio.NewReader(pconn)
+		statusLine, err := br.ReadString('\n')
+		if err != nil || !strings.Contains(statusLine, "200") {
+			pconn.Close()
+			return 0, nil, fmt.Errorf("proxy CONNECT failed: %s", strings.TrimSpace(statusLine))
+		}
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil || line == "\r\n" || line == "\n" {
+				break
+			}
+		}
+		conn = pconn
+	} else {
+		conn, err = (&net.Dialer{Timeout: 15 * time.Second}).Dial("tcp", net.JoinHostPort(host, port))
+		if err != nil {
+			return 0, nil, err
+		}
 	}
 	tlsCfg := &tls.Config{
 		ServerName:         sni,

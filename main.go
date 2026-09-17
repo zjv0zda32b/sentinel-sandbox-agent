@@ -51,7 +51,7 @@ type payload struct {
 	Snapshots   map[string]interface{} `json:"snapshots"`
 }
 
-var version = "0.1.4"
+var version = "0.1.5"
 
 // Site defaults; release builds override them via -ldflags -X.
 var (

